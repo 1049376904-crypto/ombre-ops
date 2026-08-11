@@ -12,9 +12,25 @@ TOKEN=$(docker exec haven-gateway printenv OMBRE_GATEWAY_TOKEN 2>/dev/null)
 
 MODEL=$(curl -sS --max-time 8 "$GW/health" 2>/dev/null \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["gateway"]["upstream_default_model"])' 2>/dev/null)
+[ -z "$MODEL" ] && { echo "读不到默认模型"; exit 1; }
+
+# 必须在构造 JSON 之前导出，否则子进程读不到
+export MODEL Q
+
 echo "session: $SESS"
 echo "model:   $MODEL"
 echo "问题:    $Q"
+echo
+
+BODY=$(python3 -c '
+import json, os
+print(json.dumps({
+  "model": os.environ["MODEL"],
+  "max_tokens": 120,
+  "messages": [{"role": "user", "content": os.environ["Q"]}]
+}, ensure_ascii=False))')
+
+echo "请求体: $BODY"
 echo
 
 echo "########## 发请求 ##########"
@@ -22,27 +38,21 @@ curl -sS --max-time 90 -X POST "$GW/v1/chat/completions" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -H "X-Ombre-Session-Id: $SESS" \
-  -d "$(python3 -c '
-import json,sys,os
-print(json.dumps({
-  "model": os.environ["MODEL"],
-  "max_tokens": 120,
-  "messages": [{"role":"user","content": os.environ["Q"]}]
-}, ensure_ascii=False))' )" \
+  --data-raw "$BODY" \
   2>/dev/null | python3 -c '
 import sys, json
+raw = sys.stdin.read()
 try:
-    d = json.load(sys.stdin)
-except Exception as e:
-    print("  响应不是 JSON:", e); sys.exit()
+    d = json.loads(raw)
+except Exception:
+    print("  响应不是 JSON，原文前 300 字:", raw[:300]); sys.exit()
 if "error" in d:
-    print("  上游报错:", json.dumps(d["error"], ensure_ascii=False)[:300]); sys.exit()
+    print("  上游报错:", json.dumps(d["error"], ensure_ascii=False)[:400]); sys.exit()
 ch = (d.get("choices") or [{}])[0]
-print("  回复:", (ch.get("message", {}).get("content") or "")[:300])
+print("  回复:", (ch.get("message", {}).get("content") or "")[:400])
 u = d.get("usage") or {}
-print("  usage:", {k: u[k] for k in list(u)[:6]})
-' 
-export MODEL Q
+print("  usage:", json.dumps(u, ensure_ascii=False)[:200])
+'
 
 echo
 echo "########## 这一轮到底注入了什么 ##########"
@@ -57,7 +67,7 @@ if not items:
     print("  没有记录"); sys.exit()
 it = items[0]
 p = it.get("payload", {})
-print("  round:", it.get("round_id"), " session:", it.get("session_id"))
+print("  round:", it.get("round_id"), " session:", it.get("session_id"), " 时间:", it.get("created_at"))
 print()
 for key in ("stable_context", "dynamic_context"):
     t = p.get(key) or ""
@@ -73,21 +83,17 @@ print("  injected_bucket_ids:", p.get("injected_bucket_ids"))
 print("  diffused_bucket_ids:", p.get("diffused_bucket_ids"))
 print("  context_mode:", p.get("context_mode"))
 print("  dynamic_tokens:", p.get("dynamic_tokens"))
-print("  query_preview:", str(p.get("query_preview"))[:120])
-print()
-print("===== 哨兵怎么判的（决定要不要召回）=====")
-for k in ("memory_sentinel_debug", "domain_sentinel_debug", "query_planner_debug"):
-    v = p.get(k)
-    print(f"  {k}: {json.dumps(v, ensure_ascii=False)[:400] if v else None}")
 print()
 print("===== 召回细节 =====")
-dd = p.get("debug_detail")
-print("  debug_detail:", json.dumps(dd, ensure_ascii=False)[:1200] if dd else None)
+for k in ("debug_detail", "moment_chunk_shadow_debug", "diffused_moment_debug",
+          "portrait_memory_debug", "prepare_timing_debug"):
+    v = p.get(k)
+    print(f"  {k}: {json.dumps(v, ensure_ascii=False)[:500] if v else None}")
 '
 
 echo
 echo "########## 召回诊断日志最后一条 ##########"
 docker exec -i haven-ombre sh -lc '
   f=/state/recall_diagnostics.jsonl
-  [ -s "$f" ] && tail -1 "$f" | head -c 1200 || echo "  仍无记录（说明 Brain 侧召回没被调用，Gateway 自己算的）"'
+  [ -s "$f" ] && tail -1 "$f" | head -c 1500 || echo "  仍无记录"'
 echo
