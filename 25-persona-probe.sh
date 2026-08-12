@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# persona 的 interval=3 意味着只在 round % 3 == 0 时评估。
-# round=569 被跳过是正常的（569%3=2），但 567 该评估却没写入。
-# 这个脚本在同一个 session 连发 3 轮，必然命中一次 interval，
-# 然后把那一刻的日志抓出来，看评估到底是没跑还是跑了报错。
+# persona 的 interval=3 表示只在 round % 3 == 0 时评估。
+# round=569 被跳过是正常的（569%3=2），但历史上该评估的轮次也没写入。
+# 本脚本在新 session 连发 3 轮，第 3 轮必然命中 interval，
+# 然后抓那一刻的日志，看评估是没跑还是跑了报错。
+# 消耗 3 次上游调用，每次 60 token。
 set -uo pipefail
 
 GW=http://127.0.0.1:18003
@@ -12,36 +13,52 @@ MODEL=$(curl -sS --max-time 8 "$GW/health" 2>/dev/null \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["gateway"]["upstream_default_model"])' 2>/dev/null)
 export MODEL
 
-echo "########## 1. persona 配置与模型可用性 ##########"
+echo "########## 1. persona 配置 + 直测模型（重点：json_object 支持）##########"
 docker exec -i haven-ombre python - <<'PY'
 import yaml, httpx
 cfg = yaml.safe_load(open("/app/config.yaml", encoding="utf-8"))
 p = cfg.get("persona", {}) or {}
 for k in ("enabled", "mode", "model", "base_url", "evaluation_interval_rounds",
           "event_recording_enabled", "json_response_format", "max_tokens",
-          "thinking_mode", "profile_id"):
-    v = p.get(k)
-    print(f"  {k}: {v}")
+          "thinking_mode", "profile_id", "evaluation_context_turns"):
+    print(f"  {k}: {p.get(k)}")
+
 key = p.get("api_key") or cfg["dehydration"].get("api_key", "")
 base = str(p.get("base_url") or cfg["dehydration"]["base_url"]).rstrip("/")
-print("  --- 直测 persona 模型 ---")
+
+print()
+print("  --- A. 带 response_format=json_object ---")
 try:
     r = httpx.post(f"{base}/chat/completions",
                    headers={"Authorization": f"Bearer {key}"},
-                   json={"model": p.get("model"), "max_tokens": 8,
+                   json={"model": p.get("model"), "max_tokens": 20,
                          "response_format": {"type": "json_object"},
-                         "messages": [{"role": "user",
-                                       "content": '回复一个 JSON: {"ok":1}'}]},
+                         "messages": [{"role": "user", "content": '返回 JSON: {"ok":1}'}]},
+                   timeout=30)
+    print(f"  {r.status_code}  {r.text[:240]}")
+except Exception as e:
+    print("  ERR", str(e)[:150])
+
+print()
+print("  --- B. 不带 response_format（对照）---")
+try:
+    r = httpx.post(f"{base}/chat/completions",
+                   headers={"Authorization": f"Bearer {key}"},
+                   json={"model": p.get("model"), "max_tokens": 20,
+                         "messages": [{"role": "user", "content": "说一个字"}]},
                    timeout=30)
     print(f"  {r.status_code}  {r.text[:200]}")
 except Exception as e:
     print("  ERR", str(e)[:150])
+
+print()
+print("  A 失败 B 成功 => json_response_format 要改成 false")
 PY
 
 echo
-echo "########## 2. 连发 3 轮（session=$SESS）##########"
+echo "########## 2. 连发 3 轮，session=$SESS ##########"
 for i in 1 2 3; do
-  Q="第 $i 轮：今天有点累，你陪我说说话"
+  Q="第 $i 句：今天有点累，陪我说说话"
   export Q
   BODY=$(python3 -c '
 import json, os
@@ -57,20 +74,19 @@ d = json.loads(sys.stdin.read() or "{}")
 if "error" in d:
     print("错误:", json.dumps(d["error"], ensure_ascii=False)[:150])
 else:
-    c = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-    print(c[:60].replace("\n", " "))
+    print(((d.get("choices") or [{}])[0].get("message", {}).get("content") or "")[:60].replace("\n", " "))
 '
-  sleep 3
+  sleep 4
 done
 
 echo
-echo "########## 3. 这 3 轮的 persona 日志 ##########"
-docker logs --tail 200 haven-gateway 2>&1 \
+echo "########## 3. 这几轮的 persona 日志（第 3 轮该命中 interval）##########"
+docker logs --tail 250 haven-gateway 2>&1 \
   | grep -aiE "persona|$SESS" | tail -25 \
   | sed -E 's/(sk-|Bearer )[A-Za-z0-9._-]{8,}/\1[REDACTED]/g'
 
 echo
-echo "########## 4. persona 表有没有变 ##########"
+echo "########## 4. persona 表有没有变化 ##########"
 sleep 3
 docker exec -i haven-ombre python - <<'PY'
 import sqlite3
@@ -82,18 +98,20 @@ for t in ("persona_events", "persona_session_state", "persona_exchange_log"):
         print(f"  {t}: {e}")
 r = c.execute("select updated_at from persona_global_state limit 1").fetchone()
 print("  global_state.updated_at:", r[0] if r else None)
+print("  （仍是 2026-08-07 = 评估依然没生效）")
 PY
 
 echo
-echo "########## 5. gateway 侧 persona 相关源码 ##########"
-docker exec -i haven-gateway sh -lc '
-  grep -n "Persona post-reply update skipped\|persona_post_reply\|def .*persona_post" /app/gateway.py | head -12'
+echo "########## 5. 日志里 persona 的异常 ##########"
+docker logs --tail 800 haven-gateway 2>&1 \
+  | grep -aiE 'persona.*(error|fail|exception|403|401|timeout|invalid|json|parse)' | tail -12 \
+  | sed -E 's/(sk-|Bearer )[A-Za-z0-9._-]{8,}/\1[REDACTED]/g'
+echo "  (无输出 = 日志里没有 persona 报错)"
 
 echo
-echo "########## 6. 全部日志里 persona 有没有异常 ##########"
-docker logs --tail 600 haven-gateway 2>&1 \
-  | grep -aiE 'persona.*(error|fail|exception|403|401|timeout|invalid)' | tail -10 \
-  | sed -E 's/(sk-|Bearer )[A-Za-z0-9._-]{8,}/\1[REDACTED]/g'
-echo "  (无输出 = 没有报错记录)"
+echo "########## 6. 评估函数位置 ##########"
+docker exec -i haven-gateway sh -lc '
+  grep -n "Persona post-reply\|persona_engine.evaluate\|def .*persona_post\|persona_post_reply" /app/gateway.py | head -12'
+
 echo
 echo "########## 完毕 ##########"
